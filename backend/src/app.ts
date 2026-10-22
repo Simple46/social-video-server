@@ -6,12 +6,16 @@ const app = express();
 
 app.use(
   cors({
-    origin:
-      process.env.FRONTEND_ORIGIN ??
-      "https://frontend-virid-five-97.vercel.app/",
+    origin: (process.env.FRONTEND_ORIGIN ?? "http://localhost:5173").replace(
+      /\/+$/,
+      "",
+    ),
   }),
 );
 
+app.use(express.json());
+
+app.use("/api/videos", videoRoutes);
 app.use(express.json({ limit: "10kb" }));
 
 app.get("/api/health", (_req, res) => {
