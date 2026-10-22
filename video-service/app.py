@@ -30,6 +30,7 @@ app.add_middleware(
         "https://frontend-virid-five-97.vercel.app/",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://clipnest-backend-rc9x.onrender.com",
         "http://localhost:4000",
         "http://127.0.0.1:4000",
         "http://localhost:8000",
