@@ -31,6 +31,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "https://clipnest-backend-rc9x.onrender.com",
+        "https://clipnest-backend-rc9x.onrender.com/videos/inspect",
         "http://localhost:4000",
         "http://127.0.0.1:4000",
         "http://localhost:8000",
