@@ -27,8 +27,8 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
         "https://frontend-virid-five-97.vercel.app/",
+        "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:4000",
         "http://127.0.0.1:4000",

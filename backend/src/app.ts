@@ -6,7 +6,9 @@ const app = express();
 
 app.use(
   cors({
-    origin: process.env.FRONTEND_ORIGIN ?? "http://localhost:5173",
+    origin:
+      process.env.FRONTEND_ORIGIN ??
+      "https://frontend-virid-five-97.vercel.app/",
   }),
 );
 
