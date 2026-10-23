@@ -1,3 +1,5 @@
 fastapi
 uvicorn[standard]
 yt-dlp[default]
+scikit-learn
+joblib

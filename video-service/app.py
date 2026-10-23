@@ -1,153 +1,39 @@
+from __future__ import annotations
 
-import asyncio
-import re
-from urllib.parse import urlparse
-
-import yt_dlp
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from fastapi.middleware.cors import CORSMiddleware
-
+import json
+import logging
+import os
 import shutil
 import threading
 import uuid
-
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from fastapi import BackgroundTasks
+from typing import Any
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
+
+import yt_dlp
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field, HttpUrl
 from starlette.background import BackgroundTask
 
-app = FastAPI(
-    title="Social Video Saver",
-    version="1.0.0",
-    description="Video metadata inspection service",
-)
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://frontend-virid-five-97.vercel.app",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOAD_DIR = Path(os.getenv("CLIPNEST_DOWNLOAD_DIR", BASE_DIR / "downloads"))
+DATA_DIR = Path(os.getenv("CLIPNEST_DATA_DIR", BASE_DIR / "data"))
+EVENT_LOG = DATA_DIR / "extraction_events.jsonl"
 
-
-DOWNLOAD_DIR = Path(__file__).parent / "downloads"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-download_jobs = {}
-jobs_lock = threading.Lock()
-
-SUPPORTED_QUALITIES = {"best", "720p", "480p", "360p"}
-
-
-def update_job(job_id: str, **changes):
-    with jobs_lock:
-        if job_id in download_jobs:
-            download_jobs[job_id].update(changes)
-
-
-def get_job(job_id: str):
-    with jobs_lock:
-        job = download_jobs.get(job_id)
-        return dict(job) if job else None
-
-
-def get_format_selector(quality: str) -> str:
-    if quality == "best":
-        return "bestvideo+bestaudio/best"
-
-    height = int(quality.removesuffix("p"))
-
-    return (
-        f"bestvideo[height<={height}]+bestaudio/"
-        f"best[height<={height}]/best"
-    )
-
-
-
-def run_download(job_id: str, url: str, quality: str):
-    job_dir = DOWNLOAD_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
-
-    def progress_hook(data):
-        if data["status"] == "downloading":
-            total = data.get("total_bytes") or data.get("total_bytes_estimate")
-            downloaded = data.get("downloaded_bytes", 0)
-
-            percent = round(downloaded / total * 100, 1) if total else 0
-
-            update_job(
-                job_id,
-                status="downloading",
-                progress=percent,
-            )
-
-        elif data["status"] == "finished":
-            update_job(
-                job_id,
-                status="processing",
-                progress=100,
-            )
-
-    try:
-        update_job(job_id, status="downloading", progress=0)
-
-        options = {
-            "format": get_format_selector(quality),
-            "outtmpl": str(job_dir / "%(title).80s-%(id)s.%(ext)s"),
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "socket_timeout": 20,
-            "retries": 2,
-            "fragment_retries": 2,
-            "merge_output_format": "mp4",
-            "progress_hooks": [progress_hook],
-            "js_runtimes": {"deno": {}},
-        }
-
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.download([url])
-
-        files = [
-            path for path in job_dir.iterdir()
-            if path.is_file()
-            and not path.name.endswith((".part", ".ytdl"))
-        ]
-
-        if not files:
-            raise RuntimeError("The downloaded video file was not found.")
-
-        output_file = max(files, key=lambda path: path.stat().st_size)
-
-        update_job(
-            job_id,
-            status="completed",
-            progress=100,
-            filename=output_file.name,
-            filesize=output_file.stat().st_size,
-            error=None,
-        )
-
-    except Exception as exc:
-        print(f"Download failed ({job_id}): {type(exc).__name__}: {exc}")
-
-        shutil.rmtree(job_dir, ignore_errors=True)
-
-        update_job(
-    job_id,
-    status="failed",
-    error=f"{type(exc).__name__}: {str(exc)[:500]}",
-)
-
-
-ALLOWED_HOSTS = {
+ALLOWED_DOMAINS = {
     "youtube.com",
     "youtu.be",
     "youtube-nocookie.com",
@@ -160,236 +46,476 @@ ALLOWED_HOSTS = {
     "twitter.com",
 }
 
-MAX_URL_LENGTH = 2048
+CORS_ORIGINS = [
+    "https://frontend-virid-five-97.vercel.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
 
+app = FastAPI(
+    title="Clipnest Python Video Service",
+    description="Inspect and download publicly accessible videos using yt-dlp.",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
+
+# Download work runs outside the request thread. Keep the pool small so one
+# local development machine is not overloaded by simultaneous downloads.
+executor = ThreadPoolExecutor(max_workers=2)
+jobs: dict[str, dict[str, Any]] = {}
+jobs_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
 
 class InspectRequest(BaseModel):
-    url: str = Field(min_length=1, max_length=MAX_URL_LENGTH)
+    url: HttpUrl
 
+
+class DownloadRequest(BaseModel):
+    url: HttpUrl
+    quality: str = Field(
+        default="best", description="best, 1080p, 720p, 480p, 360p, or audio")
+
+
+# ---------------------------------------------------------------------------
+# URL validation and common helpers
+# ---------------------------------------------------------------------------
 
 def validate_video_url(raw_url: str) -> str:
-    try:
-        parsed = urlparse(raw_url.strip())
-        hostname = (parsed.hostname or "").lower().rstrip(".")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid URL.")
+    """Accept HTTPS URLs only from the supported platform domains."""
+    parsed = urlparse(raw_url)
 
-    if parsed.scheme != "https":
+    if parsed.scheme.lower() != "https":
+        raise HTTPException(status_code=400, detail="Use an HTTPS video URL.")
+
+    if not parsed.hostname:
+        raise HTTPException(status_code=400, detail="The URL is invalid.")
+
+    if parsed.username or parsed.password:
         raise HTTPException(
-            status_code=400,
-            detail="Only HTTPS video links are accepted.",
-        )
+            status_code=400, detail="URLs containing credentials are not allowed.")
 
-    if not hostname or parsed.username or parsed.password:
-        raise HTTPException(status_code=400, detail="Invalid URL.")
+    try:
+        port = parsed.port
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="The URL contains an invalid port.")
 
-    allowed = any(
-        hostname == domain or hostname.endswith("." + domain)
-        for domain in ALLOWED_HOSTS
-    )
+    if port not in (None, 443):
+        raise HTTPException(
+            status_code=400, detail="Only standard HTTPS URLs are allowed.")
+
+    host = parsed.hostname.lower().rstrip(".")
+    allowed = any(host == domain or host.endswith("." + domain)
+                  for domain in ALLOWED_DOMAINS)
 
     if not allowed:
         raise HTTPException(
             status_code=400,
-            detail="This video platform is not supported.",
+            detail="This platform is not supported. Try YouTube, TikTok, Instagram, Facebook, LinkedIn, or X.",
         )
 
-    if parsed.port not in (None, 443):
-        raise HTTPException(status_code=400, detail="Invalid URL port.")
-
-    return raw_url.strip()
+    return raw_url
 
 
-def get_platform(url: str) -> str:
-    hostname = (urlparse(url).hostname or "").lower().rstrip(".")
-    hostname = hostname.removeprefix("www.")
+def get_platform(raw_url: str) -> str:
+    host = (urlparse(raw_url).hostname or "").lower().rstrip(".")
 
-    if (
-        hostname == "youtu.be"
-        or hostname == "youtube.com"
-        or hostname.endswith(".youtube.com")
-        or hostname == "youtube-nocookie.com"
-        or hostname.endswith(".youtube-nocookie.com")
-    ):
+    if host == "youtu.be" or host.endswith(("youtube.com", "youtube-nocookie.com")):
         return "youtube"
-
-    if hostname == "tiktok.com" or hostname.endswith(".tiktok.com"):
+    if host.endswith("tiktok.com"):
         return "tiktok"
-
-    if hostname == "instagram.com" or hostname.endswith(".instagram.com"):
+    if host.endswith("instagram.com"):
         return "instagram"
-
-    if (
-        hostname == "facebook.com"
-        or hostname.endswith(".facebook.com")
-        or hostname == "fb.watch"
-    ):
+    if host == "fb.watch" or host.endswith("facebook.com"):
         return "facebook"
-
-    if hostname == "linkedin.com" or hostname.endswith(".linkedin.com"):
+    if host.endswith("linkedin.com"):
         return "linkedin"
-
-    if (
-        hostname == "x.com"
-        or hostname.endswith(".x.com")
-        or hostname == "twitter.com"
-        or hostname.endswith(".twitter.com")
-    ):
+    if host.endswith(("x.com", "twitter.com")):
         return "x"
+    return "unknown"
 
-    raise HTTPException(
-        status_code=400,
-        detail="This video platform is not supported.",
-    )
 
-def inspect_video(url: str) -> dict:
-    options = {
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-    "skip_download": True,
-    "socket_timeout": 20,
-    "ignoreerrors": False,
-        "js_runtimes": {"deno": {}},
-}
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
+
+def log_event(
+    *,
+    operation: str,
+    platform: str,
+    success: bool,
+    url: str,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    quality: str | None = None,
+) -> None:
+    """Append a compact JSONL outcome record; do not save the full URL."""
+    record = {
+        "timestamp": utc_now(),
+        "operation": operation,
+        "platform": platform,
+        "success": success,
+        "quality": quality,
+        "host": urlparse(url).hostname,
+        "error_type": error_type,
+        "error_message": (error_message or "")[:500] or None,
+    }
     try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-            if not info:
-                raise ValueError("No video information was returned.")
-
-            formats = []
-            for item in info.get("formats", []):
-                if not item.get("vcodec") or item.get("vcodec") == "none":
-                    continue
-
-                formats.append({
-                    "formatId": item.get("format_id"),
-                    "ext": item.get("ext"),
-                    "height": item.get("height"),
-                    "width": item.get("width"),
-                    "filesize": item.get("filesize")
-                    or item.get("filesize_approx"),
-                })
-
-            return {
-                "title": info.get("title") or "Untitled video",
-                "platform": get_platform(url),
-                "duration": info.get("duration"),
-                "thumbnail": info.get("thumbnail"),
-                "uploader": info.get("uploader"),
-                "formats": formats[:30],
-            }
-
-    except Exception as exc:
-        # Log detailed errors on the server, but do not expose
-        # internal URLs, cookies, or extractor details to clients.
-        print(f"Video inspection failed: {type(exc).__name__}: {exc}")
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "We couldn't inspect this video. It may be unavailable, "
-                "unsupported, or require access that this service doesn't have."
-            ),
-        ) from exc
+        with EVENT_LOG.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        logging.exception("Could not write extraction event log")
 
 
-@app.get("/health")
-def health():
-    return {"success": True, "service": "video-service"}
+def package_version(package_name: str) -> str | None:
+    try:
+        return version(package_name)
+    except PackageNotFoundError:
+        return None
 
 
-@app.post("/inspect")
-async def inspect(request: InspectRequest):
-    url = validate_video_url(request.url)
-
-    # Keep the blocking extractor off the asynchronous event loop.
-    result = await asyncio.to_thread(inspect_video, url)
-
+def base_ydl_options() -> dict[str, Any]:
     return {
-        "success": True,
-        "video": result,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 25,
+        "retries": 2,
+        "fragment_retries": 2,
+        # Do not force a JavaScript runtime: yt-dlp should detect configured
+        # runtimes and report its own warnings if one is required.
     }
 
 
-class DownloadRequest(BaseModel):
-    url: str = Field(min_length=1, max_length=MAX_URL_LENGTH)
-    quality: str = "best"
+def public_metadata(info: dict[str, Any], platform: str) -> dict[str, Any]:
+    duration = info.get("duration")
+    return {
+        "id": info.get("id"),
+        "title": info.get("title") or "Untitled video",
+        "platform": platform,
+        "duration": duration,
+        "duration_seconds": duration,
+        "thumbnail": info.get("thumbnail"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "webpage_url": info.get("webpage_url"),
+        "ext": info.get("ext"),
+        "availability": info.get("availability"),
+    }
+
+
+def choose_format(quality: str) -> tuple[str, str]:
+    quality = quality.strip().lower()
+    if quality == "audio":
+        return "bestaudio/best", "mp3"
+    if quality == "best":
+        return "bestvideo*+bestaudio/best", "mp4"
+    if quality in {"1080p", "720p", "480p", "360p"}:
+        height = quality[:-1]
+        return (
+            f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best",
+            "mp4",
+        )
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid quality. Choose best, 1080p, 720p, 480p, 360p, or audio.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+def root() -> dict[str, Any]:
+    return {
+        "service": "Clipnest Python Video Service",
+        "status": "running",
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    return {"status": "ok", "service": "clipnest-python", "timestamp": utc_now()}
+
+
+@app.get("/diagnostics")
+def diagnostics() -> dict[str, Any]:
+    ffmpeg_path = shutil.which("ffmpeg")
+    deno_path = shutil.which("deno")
+    return {
+        "status": "ok",
+        "python_service": "running",
+        "yt_dlp_version": package_version("yt-dlp"),
+        "fastapi_version": package_version("fastapi"),
+        "ffmpeg_available": ffmpeg_path is not None,
+        "ffmpeg_path": ffmpeg_path,
+        "deno_available": deno_path is not None,
+        "deno_path": deno_path,
+        "download_directory_exists": DOWNLOAD_DIR.exists(),
+        "event_log": str(EVENT_LOG),
+        "supported_platforms": sorted({"youtube", "tiktok", "instagram", "facebook", "linkedin", "x"}),
+    }
+
+
+@app.post("/inspect")
+def inspect_video(payload: InspectRequest) -> dict[str, Any]:
+    raw_url = validate_video_url(str(payload.url))
+    platform = get_platform(raw_url)
+
+    try:
+        options = base_ydl_options()
+        options["extract_flat"] = False
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(raw_url, download=False)
+
+        if not info:
+            raise RuntimeError("The extractor returned no video information.")
+
+        result = public_metadata(info, platform)
+        log_event(operation="inspect", platform=platform,
+                  success=True, url=raw_url)
+        return {"success": True, "video": result}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log_event(
+            operation="inspect",
+            platform=platform,
+            success=False,
+            url=raw_url,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        logging.exception("Video inspection failed for platform=%s", platform)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Could not inspect this video. It may be private, restricted, unsupported, or the platform may require an extractor update.",
+                "error_type": type(exc).__name__,
+            },
+        )
+
+
+def run_download(job_id: str, raw_url: str, quality: str, platform: str) -> None:
+    job_dir = DOWNLOAD_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        format_selector, preferred_ext = choose_format(quality)
+
+        def progress_hook(data: dict[str, Any]) -> None:
+            status = data.get("status")
+            with jobs_lock:
+                if job_id not in jobs:
+                    return
+                if status == "downloading":
+                    jobs[job_id]["status"] = "downloading"
+                    jobs[job_id]["downloaded_bytes"] = data.get(
+                        "downloaded_bytes", 0)
+                    jobs[job_id]["total_bytes"] = data.get(
+                        "total_bytes") or data.get("total_bytes_estimate")
+                    jobs[job_id]["speed"] = data.get("speed")
+                    jobs[job_id]["eta"] = data.get("eta")
+                elif status == "finished":
+                    jobs[job_id]["status"] = "processing"
+
+        options = base_ydl_options()
+        options.update({
+            "format": format_selector,
+            "outtmpl": str(job_dir / "%(title).150B-%(id)s.%(ext)s"),
+            "merge_output_format": preferred_ext,
+            "progress_hooks": [progress_hook],
+            "overwrites": True,
+        })
+        if quality == "audio":
+            options["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }]
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(raw_url, download=True)
+            requested_downloads = info.get("requested_downloads") or []
+            candidate_paths = []
+
+            for item in requested_downloads:
+                path = item.get("filepath")
+                if path:
+                    candidate_paths.append(Path(path))
+
+            # The postprocessor/merge may change the final extension. Find the
+            # actual output file in the job directory rather than assuming one.
+            files = [p for p in job_dir.iterdir() if p.is_file(
+            ) and not p.name.endswith((".part", ".ytdl"))]
+            if not files:
+                for candidate in candidate_paths:
+                    if candidate.exists():
+                        files.append(candidate)
+
+            if not files:
+                raise RuntimeError(
+                    "yt-dlp completed without producing an output file.")
+
+            output_path = max(files, key=lambda item: item.stat().st_mtime)
+            metadata = public_metadata(info, platform)
+
+        with jobs_lock:
+            jobs[job_id].update({
+                "status": "completed",
+                "video": metadata,
+                "filename": output_path.name,
+                "file_path": str(output_path),
+                "completed_at": utc_now(),
+            })
+
+        log_event(
+            operation="download",
+            platform=platform,
+            success=True,
+            url=raw_url,
+            quality=quality,
+        )
+
+    except Exception as exc:
+        logging.exception(
+            "Video download failed for job=%s platform=%s", job_id, platform)
+        shutil.rmtree(job_dir, ignore_errors=True)
+        with jobs_lock:
+            if job_id in jobs:
+                jobs[job_id].update({
+                    "status": "failed",
+                    "error": "The download failed. Check the Python terminal for the detailed extractor error.",
+                    "error_type": type(exc).__name__,
+                    "completed_at": utc_now(),
+                })
+        log_event(
+            operation="download",
+            platform=platform,
+            success=False,
+            url=raw_url,
+            quality=quality,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
 
 
 @app.post("/download", status_code=202)
-async def start_download(request: DownloadRequest, background_tasks: BackgroundTasks):
-    url = validate_video_url(request.url)
-    quality = request.quality.lower()
+def start_download(payload: DownloadRequest) -> dict[str, Any]:
+    raw_url = validate_video_url(str(payload.url))
+    quality = payload.quality.strip().lower()
+    # Validate quality before scheduling background work.
+    choose_format(quality)
 
-    if quality not in SUPPORTED_QUALITIES:
-        raise HTTPException(
-            status_code=400,
-            detail="Quality must be best, 720p, 480p, or 360p.",
-        )
-
-    job_id = str(uuid.uuid4())
+    job_id = uuid.uuid4().hex
+    platform = get_platform(raw_url)
 
     with jobs_lock:
-        download_jobs[job_id] = {
-            "id": job_id,
+        jobs[job_id] = {
+            "job_id": job_id,
             "status": "queued",
-            "progress": 0,
+            "platform": platform,
             "quality": quality,
-            "filename": None,
-            "filesize": None,
-            "error": None,
+            "created_at": utc_now(),
+            "downloaded_bytes": 0,
+            "total_bytes": None,
+            "speed": None,
+            "eta": None,
         }
 
-    background_tasks.add_task(run_download, job_id, url, quality)
+    executor.submit(run_download, job_id, raw_url, quality, platform)
 
     return {
         "success": True,
-        "job": {
-            "id": job_id,
-            "status": "queued",
-            "statusUrl": f"/download/{job_id}",
-        },
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": f"/download/{job_id}",
+        "file_url": f"/download/{job_id}/file",
     }
 
 
 @app.get("/download/{job_id}")
-def download_status(job_id: str):
-    job = get_job(job_id)
+def download_status(job_id: str) -> dict[str, Any]:
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(
+                status_code=404, detail="Download job not found.")
+        # Never expose local filesystem paths through the API.
+        result = {key: value for key, value in job.items() if key !=
+                  "file_path"}
 
-    if not job:
-        raise HTTPException(status_code=404, detail="Download job not found.")
-
-    return {"success": True, "job": job}
+    if result["status"] == "completed":
+        result["file_url"] = f"/download/{job_id}/file"
+    return result
 
 
 @app.get("/download/{job_id}/file")
 def get_download_file(job_id: str):
-    job = get_job(job_id)
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if not job:
+            raise HTTPException(
+                status_code=404, detail="Download job not found.")
+        if job.get("status") != "completed":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Download is not ready. Current status: {job.get('status')}.",
+            )
+        file_path = Path(job.get("file_path", ""))
 
-    if not job:
-        raise HTTPException(status_code=404, detail="Download job not found.")
-
-    if job["status"] != "completed":
+    # Resolve and verify the path remains inside this service's download folder.
+    try:
+        resolved_path = file_path.resolve(strict=True)
+        resolved_path.relative_to(DOWNLOAD_DIR.resolve())
+    except (OSError, ValueError):
         raise HTTPException(
-            status_code=409,
-            detail="The download is not ready yet.",
-        )
+            status_code=404, detail="Downloaded file is no longer available.")
 
-    file_path = DOWNLOAD_DIR / job_id / job["filename"]
-
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="Downloaded file no longer exists.")
+    if not resolved_path.is_file():
+        raise HTTPException(
+            status_code=404, detail="Downloaded file is no longer available.")
 
     return FileResponse(
-        path=file_path,
-        media_type="video/mp4",
-        filename=job["filename"],
-        background=BackgroundTask(
-            shutil.rmtree,
-            str(file_path.parent),
-            ignore_errors=True,
-        ),
+        path=resolved_path,
+        filename=resolved_path.name,
+        media_type="application/octet-stream",
     )
+
+
+@app.get("/events")
+def recent_events(limit: int = 20) -> dict[str, Any]:
+    """Return recent event records for local debugging; URLs are not stored."""
+    limit = max(1, min(limit, 100))
+    if not EVENT_LOG.exists():
+        return {"events": []}
+
+    try:
+        lines = EVENT_LOG.read_text(encoding="utf-8").splitlines()
+        events = [json.loads(line) for line in lines[-limit:] if line.strip()]
+        return {"events": events}
+    except (OSError, json.JSONDecodeError):
+        logging.exception("Could not read event log")
+        raise HTTPException(
+            status_code=500, detail="Could not read the event log.")
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
