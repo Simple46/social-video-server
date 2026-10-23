@@ -1,1 +1,6 @@
 {"timestamp": "2026-10-23T16:24:10.289167+00:00", "operation": "inspect", "platform": "youtube", "success": true, "quality": null, "host": "www.youtube.com", "error_type": null, "error_message": null}
+{"timestamp": "2026-10-23T16:25:19.277944+00:00", "operation": "inspect", "platform": "youtube", "success": true, "quality": null, "host": "www.youtube.com", "error_type": null, "error_message": null}
+{"timestamp": "2026-10-23T16:27:19.985184+00:00", "operation": "inspect", "platform": "youtube", "success": true, "quality": null, "host": "www.youtube.com", "error_type": null, "error_message": null}
+{"timestamp": "2026-10-23T17:25:53.699582+00:00", "operation": "inspect", "platform": "youtube", "success": true, "quality": null, "host": "www.youtube.com", "route": {"proxy": null, "geo_bypass_country": null}, "error_type": null, "error_message": null}
+{"timestamp": "2026-10-23T17:26:23.023566+00:00", "operation": "inspect", "platform": "youtube", "success": true, "quality": null, "host": "www.youtube.com", "route": {"proxy": null, "geo_bypass_country": null}, "error_type": null, "error_message": null}
+{"timestamp": "2026-10-23T17:26:49.558399+00:00", "operation": "inspect", "platform": "youtube", "success": true, "quality": null, "host": "www.youtube.com", "route": {"proxy": null, "geo_bypass_country": null}, "error_type": null, "error_message": null}

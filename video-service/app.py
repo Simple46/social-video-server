@@ -55,7 +55,7 @@ CORS_ORIGINS = [
 app = FastAPI(
     title="Clipnest Python Video Service",
     description="Inspect and download publicly accessible videos using yt-dlp.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -71,6 +71,55 @@ app.add_middleware(
 executor = ThreadPoolExecutor(max_workers=2)
 jobs: dict[str, dict[str, Any]] = {}
 jobs_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Geo / egress configuration
+# ---------------------------------------------------------------------------
+
+def _split_env_list(value: str | None) -> list[str]:
+    """Parse a comma-separated environment variable into a clean list."""
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def mask_proxy(proxy: str) -> str:
+    """Hide credentials when reporting a proxy in API responses."""
+    parsed = urlparse(proxy)
+    if parsed.password:
+        host = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://***:***@{host}{port}"
+    return proxy
+
+
+# Proxies are tried in order, after a direct attempt. Put the most reliable
+# one first. Accepts http://, https://, socks5:// (socks5 needs pysocks).
+PROXY_URLS: list[str] = _split_env_list(os.getenv("CLIPNEST_PROXY_URLS"))
+_single_proxy = os.getenv("CLIPNEST_PROXY_URL", "").strip()
+if _single_proxy:
+    PROXY_URLS.insert(0, _single_proxy)
+
+# Optional: route only the tiny geo-verification request through a proxy and
+# let the heavy media download go direct. Saves proxy bandwidth. Only used
+# when a route has no full proxy configured.
+GEO_VERIFICATION_PROXY = os.getenv(
+    "CLIPNEST_GEO_VERIFICATION_PROXY", "").strip() or None
+
+# Spoofed X-Forwarded-For countries, used when no proxy is configured or when
+# every configured proxy has been exhausted.
+GEO_BYPASS_COUNTRIES: list[str] = [
+    code.upper() for code in _split_env_list(
+        os.getenv(
+            "CLIPNEST_GEO_BYPASS_COUNTRIES",
+            "IE,ES,IT,SE,NO,FI,PT,CZ,EE,HU,BG,IS,MT,CY,LU",
+        )
+    )
+]
+
+# Optional override for the YouTube client list. Left empty, yt-dlp picks its
+# own defaults. Example: "web_safari,tv".
+YOUTUBE_PLAYER_CLIENTS: list[str] = _split_env_list(
+    os.getenv("CLIPNEST_YOUTUBE_CLIENTS"))
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +208,7 @@ def log_event(
     error_type: str | None = None,
     error_message: str | None = None,
     quality: str | None = None,
+    route: dict[str, Any] | None = None,
 ) -> None:
     """Append a compact JSONL outcome record; do not save the full URL."""
     record = {
@@ -168,6 +218,7 @@ def log_event(
         "success": success,
         "quality": quality,
         "host": urlparse(url).hostname,
+        "route": route,
         "error_type": error_type,
         "error_message": (error_message or "")[:500] or None,
     }
@@ -185,17 +236,138 @@ def package_version(package_name: str) -> str | None:
         return None
 
 
-def base_ydl_options() -> dict[str, Any]:
-    return {
+# ---------------------------------------------------------------------------
+# yt-dlp options and egress routing
+# ---------------------------------------------------------------------------
+
+def build_ydl_options(
+    *,
+    proxy: str | None = None,
+    geo_country: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build yt-dlp options for a single egress route."""
+    options: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "socket_timeout": 25,
         "retries": 2,
         "fragment_retries": 2,
+        "geo_bypass": True,
         # Do not force a JavaScript runtime: yt-dlp should detect configured
         # runtimes and report its own warnings if one is required.
     }
+
+    if geo_country:
+        options["geo_bypass_country"] = geo_country
+
+    if proxy:
+        options["proxy"] = proxy
+    elif GEO_VERIFICATION_PROXY:
+        options["geo_verification_proxy"] = GEO_VERIFICATION_PROXY
+
+    if YOUTUBE_PLAYER_CLIENTS:
+        options["extractor_args"] = {
+            "youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}
+        }
+
+    if extra:
+        options.update(extra)
+
+    return options
+
+
+def _attempt_plan() -> list[dict[str, Any]]:
+    """Ordered egress routes: direct, then proxies, then spoofed countries."""
+    plan: list[dict[str, Any]] = [{"proxy": None, "geo_country": None}]
+    plan += [{"proxy": url, "geo_country": None} for url in PROXY_URLS]
+    plan += [{"proxy": None, "geo_country": code}
+             for code in GEO_BYPASS_COUNTRIES]
+    return plan
+
+
+def _route_label(route: dict[str, Any]) -> dict[str, Any]:
+    """Safe, serialisable description of a route."""
+    return {
+        "proxy": mask_proxy(route["proxy"]) if route.get("proxy") else None,
+        "geo_bypass_country": route.get("geo_country"),
+    }
+
+
+_GEO_MARKERS = (
+    "not available in your country",
+    "geo restricted",
+    "geo-restricted",
+    "available in your country",
+    "not available in this country",
+)
+
+_RETRY_MARKERS = (
+    "timed out",
+    "connection reset",
+    "connection aborted",
+    "temporarily unavailable",
+    "http error 403",
+    "http error 429",
+    "unable to download webpage",
+)
+
+
+def _is_geo_error(exc: Exception) -> bool:
+    if isinstance(exc, yt_dlp.utils.GeoRestrictedError):
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in _GEO_MARKERS)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Geo blocks and transient network faults are worth another route."""
+    if _is_geo_error(exc):
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in _RETRY_MARKERS)
+
+
+def extract_info_with_fallback(
+    raw_url: str,
+    *,
+    download: bool,
+    extra: dict[str, Any] | None = None,
+    on_route: Any = None,
+) -> dict[str, Any]:
+    """Extract or download, walking the route plan until one succeeds.
+
+    Raises the first non-retryable error, or the last error if every route
+    was exhausted.
+    """
+    plan = _attempt_plan()
+    last_error: Exception | None = None
+
+    for index, route in enumerate(plan):
+        options = build_ydl_options(**route, extra=extra)
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(raw_url, download=download)
+            if on_route:
+                on_route(route, index, plan)
+            return info
+        except Exception as exc:  # noqa: BLE001
+            if not _is_retryable(exc) or index == len(plan) - 1:
+                raise
+            last_error = exc
+            logging.warning(
+                "Route failed (attempt %s/%s, proxy=%s, country=%s): %s",
+                index + 1,
+                len(plan),
+                mask_proxy(route["proxy"]) if route["proxy"] else None,
+                route["geo_country"],
+                str(exc).splitlines()[0][:200],
+            )
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("No egress route was available.")
 
 
 def public_metadata(info: dict[str, Any], platform: str) -> dict[str, Any]:
@@ -266,7 +438,60 @@ def diagnostics() -> dict[str, Any]:
         "deno_path": deno_path,
         "download_directory_exists": DOWNLOAD_DIR.exists(),
         "event_log": str(EVENT_LOG),
-        "supported_platforms": sorted({"youtube", "tiktok", "instagram", "facebook", "linkedin", "x"}),
+        "supported_platforms": sorted(
+            {"youtube", "tiktok", "instagram", "facebook", "linkedin", "x"}),
+        # --- egress / geo configuration ---
+        "egress_routes": len(_attempt_plan()),
+        "proxies_configured": len(PROXY_URLS),
+        "proxy_hosts": [mask_proxy(proxy) for proxy in PROXY_URLS],
+        "geo_bypass_countries": GEO_BYPASS_COUNTRIES,
+        "geo_verification_proxy": (
+            mask_proxy(GEO_VERIFICATION_PROXY)
+            if GEO_VERIFICATION_PROXY else None
+        ),
+        "youtube_player_clients": YOUTUBE_PLAYER_CLIENTS or None,
+    }
+
+
+@app.get("/routes")
+def routes() -> dict[str, Any]:
+    """The exact order yt-dlp will try egress routes in."""
+    return {
+        "total_routes": len(_attempt_plan()),
+        "routes": [
+            {"attempt": index + 1, **_route_label(route)}
+            for index, route in enumerate(_attempt_plan())
+        ],
+    }
+
+
+@app.post("/geo-test")
+def geo_test(payload: InspectRequest) -> dict[str, Any]:
+    """Test every configured route against a URL and report which ones work.
+
+    Unlike /inspect this does not stop at the first success, so it tells you
+    exactly which proxies and spoofed countries are usable right now.
+    """
+    raw_url = validate_video_url(str(payload.url))
+    results: list[dict[str, Any]] = []
+
+    for index, route in enumerate(_attempt_plan()):
+        entry: dict[str, Any] = {"attempt": index + 1, **_route_label(route)}
+        try:
+            with yt_dlp.YoutubeDL(build_ydl_options(**route)) as ydl:
+                info = ydl.extract_info(raw_url, download=False)
+            entry["ok"] = True
+            entry["title"] = info.get("title")
+        except Exception as exc:  # noqa: BLE001
+            entry["ok"] = False
+            entry["error"] = str(exc).splitlines()[0][:180]
+        results.append(entry)
+
+    return {
+        "url": raw_url,
+        "total_routes": len(results),
+        "working_routes": sum(1 for item in results if item["ok"]),
+        "results": results,
     }
 
 
@@ -274,25 +499,37 @@ def diagnostics() -> dict[str, Any]:
 def inspect_video(payload: InspectRequest) -> dict[str, Any]:
     raw_url = validate_video_url(str(payload.url))
     platform = get_platform(raw_url)
+    used_route: dict[str, Any] = {}
+
+    def record_route(route: dict[str, Any], index: int,
+                     plan: list[dict[str, Any]]) -> None:
+        used_route.update(_route_label(route))
 
     try:
-        options = base_ydl_options()
-        options["extract_flat"] = False
-
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(raw_url, download=False)
+        info = extract_info_with_fallback(
+            raw_url,
+            download=False,
+            extra={"extract_flat": False},
+            on_route=record_route,
+        )
 
         if not info:
             raise RuntimeError("The extractor returned no video information.")
 
         result = public_metadata(info, platform)
-        log_event(operation="inspect", platform=platform,
-                  success=True, url=raw_url)
+        log_event(
+            operation="inspect",
+            platform=platform,
+            success=True,
+            url=raw_url,
+            route=used_route or None,
+        )
         return {"success": True, "video": result}
 
     except HTTPException:
         raise
     except Exception as exc:
+        geo_blocked = _is_geo_error(exc)
         log_event(
             operation="inspect",
             platform=platform,
@@ -305,8 +542,17 @@ def inspect_video(payload: InspectRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=422,
             detail={
-                "message": "Could not inspect this video. It may be private, restricted, unsupported, or the platform may require an extractor update.",
+                "message": (
+                    "This video is geo-blocked and none of the configured "
+                    "egress routes could reach it. Add a proxy in an allowed "
+                    "country and retry."
+                    if geo_blocked
+                    else "Could not inspect this video. It may be private, "
+                         "restricted, unsupported, or the platform may require "
+                         "an extractor update."
+                ),
                 "error_type": type(exc).__name__,
+                "geo_blocked": geo_blocked,
             },
         )
 
@@ -334,46 +580,60 @@ def run_download(job_id: str, raw_url: str, quality: str, platform: str) -> None
                 elif status == "finished":
                     jobs[job_id]["status"] = "processing"
 
-        options = base_ydl_options()
-        options.update({
+        def record_route(route: dict[str, Any], index: int,
+                         plan: list[dict[str, Any]]) -> None:
+            with jobs_lock:
+                if job_id in jobs:
+                    jobs[job_id]["route"] = {
+                        **_route_label(route),
+                        "attempt": index + 1,
+                        "total_routes": len(plan),
+                    }
+
+        download_options: dict[str, Any] = {
             "format": format_selector,
             "outtmpl": str(job_dir / "%(title).150B-%(id)s.%(ext)s"),
             "merge_output_format": preferred_ext,
             "progress_hooks": [progress_hook],
             "overwrites": True,
-        })
+        }
         if quality == "audio":
-            options["postprocessors"] = [{
+            download_options["postprocessors"] = [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             }]
 
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(raw_url, download=True)
-            requested_downloads = info.get("requested_downloads") or []
-            candidate_paths = []
+        info = extract_info_with_fallback(
+            raw_url,
+            download=True,
+            extra=download_options,
+            on_route=record_route,
+        )
 
-            for item in requested_downloads:
-                path = item.get("filepath")
-                if path:
-                    candidate_paths.append(Path(path))
+        requested_downloads = info.get("requested_downloads") or []
+        candidate_paths = []
 
-            # The postprocessor/merge may change the final extension. Find the
-            # actual output file in the job directory rather than assuming one.
-            files = [p for p in job_dir.iterdir() if p.is_file(
-            ) and not p.name.endswith((".part", ".ytdl"))]
-            if not files:
-                for candidate in candidate_paths:
-                    if candidate.exists():
-                        files.append(candidate)
+        for item in requested_downloads:
+            path = item.get("filepath")
+            if path:
+                candidate_paths.append(Path(path))
 
-            if not files:
-                raise RuntimeError(
-                    "yt-dlp completed without producing an output file.")
+        # The postprocessor/merge may change the final extension. Find the
+        # actual output file in the job directory rather than assuming one.
+        files = [p for p in job_dir.iterdir() if p.is_file(
+        ) and not p.name.endswith((".part", ".ytdl"))]
+        if not files:
+            for candidate in candidate_paths:
+                if candidate.exists():
+                    files.append(candidate)
 
-            output_path = max(files, key=lambda item: item.stat().st_mtime)
-            metadata = public_metadata(info, platform)
+        if not files:
+            raise RuntimeError(
+                "yt-dlp completed without producing an output file.")
+
+        output_path = max(files, key=lambda item: item.stat().st_mtime)
+        metadata = public_metadata(info, platform)
 
         with jobs_lock:
             jobs[job_id].update({
@@ -390,18 +650,27 @@ def run_download(job_id: str, raw_url: str, quality: str, platform: str) -> None
             success=True,
             url=raw_url,
             quality=quality,
+            route=jobs.get(job_id, {}).get("route"),
         )
 
     except Exception as exc:
         logging.exception(
             "Video download failed for job=%s platform=%s", job_id, platform)
         shutil.rmtree(job_dir, ignore_errors=True)
+        geo_blocked = _is_geo_error(exc)
         with jobs_lock:
             if job_id in jobs:
                 jobs[job_id].update({
                     "status": "failed",
-                    "error": "The download failed. Check the Python terminal for the detailed extractor error.",
+                    "error": (
+                        "This video is geo-blocked and no configured egress "
+                        "route could reach it."
+                        if geo_blocked
+                        else "The download failed. Check the Python terminal "
+                             "for the detailed extractor error."
+                    ),
                     "error_type": type(exc).__name__,
+                    "geo_blocked": geo_blocked,
                     "completed_at": utc_now(),
                 })
         log_event(
@@ -495,6 +764,8 @@ def get_download_file(job_id: str):
         path=resolved_path,
         filename=resolved_path.name,
         media_type="application/octet-stream",
+        background=BackgroundTask(shutil.rmtree, resolved_path.parent,
+                                  ignore_errors=True),
     )
 
 

@@ -1,5 +1,11 @@
+# fastapi
+# uvicorn[standard]
+# yt-dlp[default]
+# scikit-learn
+# joblib
+
 fastapi
 uvicorn[standard]
-yt-dlp[default]
-scikit-learn
-joblib
+yt-dlp>=2025.9.5
+pydantic>=2
+pysocks          # only if you use socks5:// proxies
