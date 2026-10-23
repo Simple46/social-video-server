@@ -27,4 +27,11 @@ app.get("/api/health", (_req, res) => {
 
 app.use("/api/videos", videoRoutes);
 
+app.get("/api/debug/routes", (_req, res) => {
+  res.json({
+    message: "Latest backend app is running",
+    routes: ["/api/health", "/api/videos/inspect", "/api/videos/download"],
+  });
+});
+
 export default app;
