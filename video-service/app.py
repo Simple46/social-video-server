@@ -4,7 +4,10 @@ import json
 import logging
 import os
 import shutil
+import socket
 import threading
+import time
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
@@ -55,7 +58,7 @@ CORS_ORIGINS = [
 app = FastAPI(
     title="Clipnest Python Video Service",
     description="Inspect and download publicly accessible videos using yt-dlp.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -92,18 +95,61 @@ def mask_proxy(proxy: str) -> str:
     return proxy
 
 
+_PROXY_SCHEMES = {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}
+
+
+def normalize_proxy(raw: str) -> str | None:
+    """Repair and validate a proxy URL, or return None if unusable.
+
+    Handles the two most common paste mistakes: a missing scheme
+    ("host:8080" parses as scheme="host") and a stray trailing slash.
+    """
+    value = (raw or "").strip().rstrip("/")
+    if not value:
+        return None
+
+    if "://" not in value:
+        value = "http://" + value
+
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower()
+
+    if scheme not in _PROXY_SCHEMES:
+        logging.warning(
+            "Ignoring proxy with unsupported scheme %r: %s", scheme, value)
+        return None
+
+    if not parsed.hostname:
+        logging.warning("Ignoring proxy without a hostname: %s", value)
+        return None
+
+    try:
+        parsed.port
+    except ValueError:
+        logging.warning("Ignoring proxy with an invalid port: %s", value)
+        return None
+
+    return value
+
+
 # Proxies are tried in order, after a direct attempt. Put the most reliable
 # one first. Accepts http://, https://, socks5:// (socks5 needs pysocks).
-PROXY_URLS: list[str] = _split_env_list(os.getenv("CLIPNEST_PROXY_URLS"))
+_raw_proxies = _split_env_list(os.getenv("CLIPNEST_PROXY_URLS"))
 _single_proxy = os.getenv("CLIPNEST_PROXY_URL", "").strip()
 if _single_proxy:
-    PROXY_URLS.insert(0, _single_proxy)
+    _raw_proxies.insert(0, _single_proxy)
+
+PROXY_URLS: list[str] = []
+for _raw in _raw_proxies:
+    _normalized = normalize_proxy(_raw)
+    if _normalized and _normalized not in PROXY_URLS:
+        PROXY_URLS.append(_normalized)
 
 # Optional: route only the tiny geo-verification request through a proxy and
 # let the heavy media download go direct. Saves proxy bandwidth. Only used
 # when a route has no full proxy configured.
-GEO_VERIFICATION_PROXY = os.getenv(
-    "CLIPNEST_GEO_VERIFICATION_PROXY", "").strip() or None
+GEO_VERIFICATION_PROXY = normalize_proxy(
+    os.getenv("CLIPNEST_GEO_VERIFICATION_PROXY", ""))
 
 # Spoofed X-Forwarded-For countries, used when no proxy is configured or when
 # every configured proxy has been exhausted.
@@ -120,6 +166,39 @@ GEO_BYPASS_COUNTRIES: list[str] = [
 # own defaults. Example: "web_safari,tv".
 YOUTUBE_PLAYER_CLIENTS: list[str] = _split_env_list(
     os.getenv("CLIPNEST_YOUTUBE_CLIENTS"))
+
+# How long to trust a proxy hostname's DNS result before re-checking.
+DNS_CACHE_TTL = 60.0
+_dns_cache: dict[str, tuple[float, bool]] = {}
+_dns_lock = threading.Lock()
+
+
+def proxy_host_resolves(proxy: str) -> bool:
+    """Cached DNS check so a bogus proxy hostname is skipped, not retried."""
+    host = urlparse(proxy).hostname
+    if not host:
+        return False
+
+    now = time.monotonic()
+    with _dns_lock:
+        cached = _dns_cache.get(host)
+        if cached and now - cached[0] < DNS_CACHE_TTL:
+            return cached[1]
+
+    try:
+        socket.getaddrinfo(host, None)
+        resolves = True
+    except socket.gaierror:
+        resolves = False
+
+    with _dns_lock:
+        _dns_cache[host] = (now, resolves)
+
+    if not resolves:
+        logging.warning(
+            "Proxy host %r does not resolve; skipping that route for now", host)
+
+    return resolves
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +288,7 @@ def log_event(
     error_message: str | None = None,
     quality: str | None = None,
     route: dict[str, Any] | None = None,
+    attempts: list[dict[str, Any]] | None = None,
 ) -> None:
     """Append a compact JSONL outcome record; do not save the full URL."""
     record = {
@@ -219,6 +299,7 @@ def log_event(
         "quality": quality,
         "host": urlparse(url).hostname,
         "route": route,
+        "attempts": attempts,
         "error_type": error_type,
         "error_message": (error_message or "")[:500] or None,
     }
@@ -239,6 +320,23 @@ def package_version(package_name: str) -> str | None:
 # ---------------------------------------------------------------------------
 # yt-dlp options and egress routing
 # ---------------------------------------------------------------------------
+
+class EgressFailure(RuntimeError):
+    """Every egress route failed. Carries a per-route failure report."""
+
+    def __init__(self, failures: list[dict[str, Any]],
+                 permanent: bool = False) -> None:
+        self.failures = failures
+        self.permanent = permanent
+        self.last_error = failures[-1]["error"] if failures else None
+        summary = " | ".join(
+            f"{item['attempt']}:"
+            f"{item['proxy'] or item['geo_bypass_country'] or 'direct'}"
+            f" -> {item['error']}"
+            for item in failures
+        )
+        super().__init__(summary or "All egress routes failed.")
+
 
 def build_ydl_options(
     *,
@@ -278,10 +376,21 @@ def build_ydl_options(
     return options
 
 
-def _attempt_plan() -> list[dict[str, Any]]:
-    """Ordered egress routes: direct, then proxies, then spoofed countries."""
+def _attempt_plan(*, include_unresolvable: bool = False) -> list[dict[str, Any]]:
+    """Ordered egress routes: direct, then proxies, then spoofed countries.
+
+    Proxies whose hostname fails DNS are dropped, unless that would leave no
+    proxy routes at all (in which case they are kept so the failure is
+    reported rather than silently ignored).
+    """
     plan: list[dict[str, Any]] = [{"proxy": None, "geo_country": None}]
-    plan += [{"proxy": url, "geo_country": None} for url in PROXY_URLS]
+
+    usable = [proxy for proxy in PROXY_URLS
+              if include_unresolvable or proxy_host_resolves(proxy)]
+    if not usable and PROXY_URLS:
+        usable = list(PROXY_URLS)
+
+    plan += [{"proxy": proxy, "geo_country": None} for proxy in usable]
     plan += [{"proxy": None, "geo_country": code}
              for code in GEO_BYPASS_COUNTRIES]
     return plan
@@ -303,14 +412,17 @@ _GEO_MARKERS = (
     "not available in this country",
 )
 
-_RETRY_MARKERS = (
-    "timed out",
-    "connection reset",
-    "connection aborted",
-    "temporarily unavailable",
-    "http error 403",
-    "http error 429",
-    "unable to download webpage",
+# Only these genuinely mean "another route will not help". Everything else
+# (DNS failures, TLS resets, timeouts, 403s, bot checks) is worth retrying.
+_PERMANENT_MARKERS = (
+    "video unavailable",
+    "this video is private",
+    "private video",
+    "has been removed by the uploader",
+    "does not exist",
+    "not a valid url",
+    "unsupported url",
+    "incomplete youtube id",
 )
 
 
@@ -321,12 +433,12 @@ def _is_geo_error(exc: Exception) -> bool:
     return any(marker in message for marker in _GEO_MARKERS)
 
 
-def _is_retryable(exc: Exception) -> bool:
-    """Geo blocks and transient network faults are worth another route."""
+def _is_permanent(exc: Exception) -> bool:
+    """True when retrying through another egress route cannot help."""
     if _is_geo_error(exc):
-        return True
+        return False
     message = str(exc).lower()
-    return any(marker in message for marker in _RETRY_MARKERS)
+    return any(marker in message for marker in _PERMANENT_MARKERS)
 
 
 def extract_info_with_fallback(
@@ -338,11 +450,12 @@ def extract_info_with_fallback(
 ) -> dict[str, Any]:
     """Extract or download, walking the route plan until one succeeds.
 
-    Raises the first non-retryable error, or the last error if every route
-    was exhausted.
+    Raises EgressFailure with a per-route report if every route fails, or if
+    a permanent error is hit.
     """
     plan = _attempt_plan()
-    last_error: Exception | None = None
+    failures: list[dict[str, Any]] = []
+    last_exc: Exception | None = None
 
     for index, route in enumerate(plan):
         options = build_ydl_options(**route, extra=extra)
@@ -353,9 +466,16 @@ def extract_info_with_fallback(
                 on_route(route, index, plan)
             return info
         except Exception as exc:  # noqa: BLE001
-            if not _is_retryable(exc) or index == len(plan) - 1:
-                raise
-            last_error = exc
+            last_exc = exc
+            failures.append({
+                "attempt": index + 1,
+                "total_routes": len(plan),
+                **_route_label(route),
+                "geo": _is_geo_error(exc),
+                "error_type": type(exc).__name__,
+                "error": str(exc).splitlines()[0][:200],
+            })
+
             logging.warning(
                 "Route failed (attempt %s/%s, proxy=%s, country=%s): %s",
                 index + 1,
@@ -365,9 +485,13 @@ def extract_info_with_fallback(
                 str(exc).splitlines()[0][:200],
             )
 
-    if last_error:
-        raise last_error
-    raise RuntimeError("No egress route was available.")
+            if _is_permanent(exc):
+                raise EgressFailure(failures, permanent=True) from exc
+
+            if index < len(plan) - 1:
+                time.sleep(0.5)
+
+    raise EgressFailure(failures) from last_exc
 
 
 def public_metadata(info: dict[str, Any], platform: str) -> dict[str, Any]:
@@ -443,7 +567,14 @@ def diagnostics() -> dict[str, Any]:
         # --- egress / geo configuration ---
         "egress_routes": len(_attempt_plan()),
         "proxies_configured": len(PROXY_URLS),
-        "proxy_hosts": [mask_proxy(proxy) for proxy in PROXY_URLS],
+        "proxy_hosts": [
+            {
+                "proxy": mask_proxy(proxy),
+                "host": urlparse(proxy).hostname,
+                "resolves": proxy_host_resolves(proxy),
+            }
+            for proxy in PROXY_URLS
+        ],
         "geo_bypass_countries": GEO_BYPASS_COUNTRIES,
         "geo_verification_proxy": (
             mask_proxy(GEO_VERIFICATION_PROXY)
@@ -462,6 +593,57 @@ def routes() -> dict[str, Any]:
             {"attempt": index + 1, **_route_label(route)}
             for index, route in enumerate(_attempt_plan())
         ],
+    }
+
+
+@app.get("/proxy-check")
+def proxy_check() -> dict[str, Any]:
+    """DNS, TCP and HTTP reachability for every configured proxy."""
+    results: list[dict[str, Any]] = []
+
+    for proxy in PROXY_URLS:
+        parsed = urlparse(proxy)
+        host = parsed.hostname or ""
+        port = parsed.port
+        entry: dict[str, Any] = {
+            "proxy": mask_proxy(proxy),
+            "host": host,
+            "port": port,
+        }
+
+        try:
+            socket.getaddrinfo(host, None)
+            entry["dns"] = "ok"
+        except socket.gaierror as exc:
+            entry["dns"] = f"failed: {exc}"
+
+        if port and entry["dns"] == "ok":
+            try:
+                with socket.create_connection((host, port), timeout=5):
+                    entry["tcp"] = "ok"
+            except OSError as exc:
+                entry["tcp"] = f"failed: {exc}"
+
+        # urllib only understands http/https proxies, not socks.
+        if entry.get("tcp") == "ok" and parsed.scheme.lower() in {"http", "https"}:
+            try:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+                with opener.open(
+                    "https://www.youtube.com/generate_204", timeout=10
+                ) as response:
+                    entry["http"] = f"ok ({response.status})"
+            except Exception as exc:  # noqa: BLE001
+                entry["http"] = f"failed: {type(exc).__name__}: {exc}"
+
+        results.append(entry)
+
+    return {
+        "proxies": results,
+        "note": (
+            "dns=ok and tcp=ok are the minimum. http=ok confirms the proxy "
+            "actually forwards HTTPS."
+        ),
     }
 
 
@@ -484,6 +666,7 @@ def geo_test(payload: InspectRequest) -> dict[str, Any]:
             entry["title"] = info.get("title")
         except Exception as exc:  # noqa: BLE001
             entry["ok"] = False
+            entry["error_type"] = type(exc).__name__
             entry["error"] = str(exc).splitlines()[0][:180]
         results.append(entry)
 
@@ -528,8 +711,47 @@ def inspect_video(payload: InspectRequest) -> dict[str, Any]:
 
     except HTTPException:
         raise
+
+    except EgressFailure as exc:
+        geo_blocked = any(item["geo"] for item in exc.failures)
+        log_event(
+            operation="inspect",
+            platform=platform,
+            success=False,
+            url=raw_url,
+            error_type="EgressFailure",
+            error_message=str(exc),
+            attempts=exc.failures,
+        )
+        logging.exception("Video inspection failed for platform=%s", platform)
+
+        if exc.permanent:
+            message = "The video is permanently unavailable: " + (
+                exc.last_error or "unknown reason")
+        elif geo_blocked:
+            message = (
+                "This video is geo-blocked and none of the configured egress "
+                "routes could reach it. Check /proxy-check, then add a proxy "
+                "in an allowed country."
+            )
+        else:
+            message = (
+                "Every egress route failed. See 'attempts' for the per-route "
+                "error, and check /diagnostics and /proxy-check."
+            )
+
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": message,
+                "error_type": "EgressFailure",
+                "permanent": exc.permanent,
+                "geo_blocked": geo_blocked,
+                "attempts": exc.failures,
+            },
+        )
+
     except Exception as exc:
-        geo_blocked = _is_geo_error(exc)
         log_event(
             operation="inspect",
             platform=platform,
@@ -542,17 +764,8 @@ def inspect_video(payload: InspectRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=422,
             detail={
-                "message": (
-                    "This video is geo-blocked and none of the configured "
-                    "egress routes could reach it. Add a proxy in an allowed "
-                    "country and retry."
-                    if geo_blocked
-                    else "Could not inspect this video. It may be private, "
-                         "restricted, unsupported, or the platform may require "
-                         "an extractor update."
-                ),
+                "message": "Could not inspect this video.",
                 "error_type": type(exc).__name__,
-                "geo_blocked": geo_blocked,
             },
         )
 
@@ -657,7 +870,11 @@ def run_download(job_id: str, raw_url: str, quality: str, platform: str) -> None
         logging.exception(
             "Video download failed for job=%s platform=%s", job_id, platform)
         shutil.rmtree(job_dir, ignore_errors=True)
-        geo_blocked = _is_geo_error(exc)
+
+        failures = getattr(exc, "failures", None)
+        geo_blocked = bool(failures) and any(
+            item.get("geo") for item in failures)
+
         with jobs_lock:
             if job_id in jobs:
                 jobs[job_id].update({
@@ -666,11 +883,12 @@ def run_download(job_id: str, raw_url: str, quality: str, platform: str) -> None
                         "This video is geo-blocked and no configured egress "
                         "route could reach it."
                         if geo_blocked
-                        else "The download failed. Check the Python terminal "
-                             "for the detailed extractor error."
+                        else "The download failed on every configured egress "
+                             "route. See 'attempts' for details."
                     ),
                     "error_type": type(exc).__name__,
                     "geo_blocked": geo_blocked,
+                    "attempts": failures,
                     "completed_at": utc_now(),
                 })
         log_event(
@@ -681,6 +899,7 @@ def run_download(job_id: str, raw_url: str, quality: str, platform: str) -> None
             quality=quality,
             error_type=type(exc).__name__,
             error_message=str(exc),
+            attempts=failures,
         )
 
 
@@ -790,3 +1009,4 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
+
