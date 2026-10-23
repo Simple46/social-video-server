@@ -8,6 +8,16 @@ import {
 
 const router = Router();
 
+// router.use((req, _res, next) => {
+//   console.log(`[VIDEO ROUTER] ${req.method} ${req.originalUrl}`);
+//   next();
+// });
+
+// router.post("/inspect", async (req, res) => {
+//   console.log("[INSPECT HANDLER] Reached");
+//   // Keep the rest of your existing handler unchanged.
+// });
+
 const VIDEO_SERVICE_URL =
   process.env.VIDEO_SERVICE_URL ?? "http://127.0.0.1:8000";
 

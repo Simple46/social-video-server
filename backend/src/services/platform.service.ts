@@ -3,24 +3,28 @@ export type VideoPlatform =
   | "tiktok"
   | "instagram"
   | "facebook"
+  | "linkedin"
+  | "x"
   | "unknown";
 
 export function detectPlatform(url: string): VideoPlatform {
   let hostname: string;
 
   try {
-    hostname = new URL(url).hostname.toLowerCase();
+    hostname = new URL(url).hostname.toLowerCase().replace(/\.$/, "");
   } catch {
     return "unknown";
   }
 
+  // Normalize www and mobile subdomains through domain matching.
   const host = hostname.replace(/^www\./, "");
 
   if (
     host === "youtube.com" ||
-    host === "m.youtube.com" ||
+    host.endsWith(".youtube.com") ||
     host === "youtu.be" ||
-    host === "youtube-nocookie.com"
+    host === "youtube-nocookie.com" ||
+    host.endsWith(".youtube-nocookie.com")
   ) {
     return "youtube";
   }
@@ -36,10 +40,22 @@ export function detectPlatform(url: string): VideoPlatform {
   if (
     host === "facebook.com" ||
     host.endsWith(".facebook.com") ||
-    host === "fb.watch" ||
-    host.endsWith(".fb.watch")
+    host === "fb.watch"
   ) {
     return "facebook";
+  }
+
+  if (host === "linkedin.com" || host.endsWith(".linkedin.com")) {
+    return "linkedin";
+  }
+
+  if (
+    host === "x.com" ||
+    host.endsWith(".x.com") ||
+    host === "twitter.com" ||
+    host.endsWith(".twitter.com")
+  ) {
+    return "x";
   }
 
   return "unknown";
@@ -62,8 +78,19 @@ export function validateVideoUrl(input: unknown): {
     return { valid: false, error: "Please enter a valid URL." };
   }
 
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    return { valid: false, error: "Only HTTP and HTTPS links are supported." };
+  if (parsed.protocol !== "https:") {
+    return {
+      valid: false,
+      error: "Please use a secure HTTPS video link.",
+    };
+  }
+
+  if (
+    parsed.username ||
+    parsed.password ||
+    (parsed.port && parsed.port !== "443")
+  ) {
+    return { valid: false, error: "This URL is not allowed." };
   }
 
   const platform = detectPlatform(parsed.toString());

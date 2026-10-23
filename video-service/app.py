@@ -27,15 +27,9 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://frontend-virid-five-97.vercel.app/",
+        "https://frontend-virid-five-97.vercel.app",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "https://clipnest-backend-rc9x.onrender.com",
-        "https://clipnest-backend-rc9x.onrender.com/videos/inspect",
-        "http://localhost:4000",
-        "http://127.0.0.1:4000",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
     ],
     allow_credentials=False,
     allow_methods=["*"],
@@ -115,7 +109,7 @@ def run_download(job_id: str, url: str, quality: str):
             "fragment_retries": 2,
             "merge_output_format": "mp4",
             "progress_hooks": [progress_hook],
-            "js_runtimes": {"node": {}},
+            "js_runtimes": {"deno": {}},
         }
 
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -152,6 +146,7 @@ def run_download(job_id: str, url: str, quality: str):
     error=f"{type(exc).__name__}: {str(exc)[:500]}",
 )
 
+
 ALLOWED_HOSTS = {
     "youtube.com",
     "youtu.be",
@@ -160,6 +155,9 @@ ALLOWED_HOSTS = {
     "instagram.com",
     "facebook.com",
     "fb.watch",
+    "linkedin.com",
+    "x.com",
+    "twitter.com",
 }
 
 MAX_URL_LENGTH = 2048
@@ -203,11 +201,16 @@ def validate_video_url(raw_url: str) -> str:
 
 
 def get_platform(url: str) -> str:
-    hostname = urlparse(url).hostname.lower().rstrip(".")
+    hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+    hostname = hostname.removeprefix("www.")
 
-    if hostname == "youtu.be" or hostname.endswith(
-        (".youtube.com", ".youtube-nocookie.com")
-    ) or hostname in {"youtube.com", "youtube-nocookie.com"}:
+    if (
+        hostname == "youtu.be"
+        or hostname == "youtube.com"
+        or hostname.endswith(".youtube.com")
+        or hostname == "youtube-nocookie.com"
+        or hostname.endswith(".youtube-nocookie.com")
+    ):
         return "youtube"
 
     if hostname == "tiktok.com" or hostname.endswith(".tiktok.com"):
@@ -216,8 +219,28 @@ def get_platform(url: str) -> str:
     if hostname == "instagram.com" or hostname.endswith(".instagram.com"):
         return "instagram"
 
-    return "facebook"
+    if (
+        hostname == "facebook.com"
+        or hostname.endswith(".facebook.com")
+        or hostname == "fb.watch"
+    ):
+        return "facebook"
 
+    if hostname == "linkedin.com" or hostname.endswith(".linkedin.com"):
+        return "linkedin"
+
+    if (
+        hostname == "x.com"
+        or hostname.endswith(".x.com")
+        or hostname == "twitter.com"
+        or hostname.endswith(".twitter.com")
+    ):
+        return "x"
+
+    raise HTTPException(
+        status_code=400,
+        detail="This video platform is not supported.",
+    )
 
 def inspect_video(url: str) -> dict:
     options = {
@@ -227,9 +250,7 @@ def inspect_video(url: str) -> dict:
     "skip_download": True,
     "socket_timeout": 20,
     "ignoreerrors": False,
-    "js_runtimes": {
-        "node": {}
-    },
+        "js_runtimes": {"deno": {}},
 }
 
     try:
